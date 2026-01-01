@@ -1,7 +1,9 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState } from "react";
 
 export default function GraphCanvas() {
 	const canvasRef = useRef(null);
+	const ctxRef = useRef(null);
+
 	const sizeRef = useRef({ width: 0, height: 0 });
 
 	const isPanningRef = useRef(false);
@@ -10,10 +12,14 @@ export default function GraphCanvas() {
 	const MIN_SCALE = 10;
 	const MAX_SCALE = 500;
 
+	const [expression, setExpression] = useState("x^2");
+	const rpnRef = useRef(null);
+
 
 	useEffect(() => {
 		const canvas = canvasRef.current;
 		const ctx = canvas.getContext("2d");
+		ctxRef.current = ctx;
 		ctx.imageSmoothingEnabled = false;
 		ctx.lineCap = "butt";
 
@@ -118,6 +124,30 @@ export default function GraphCanvas() {
 
 	}, []);
 
+	useEffect(() => {
+		try {
+			const tokens = tokenize(expression);
+			const withMul = insertImplicitMultiplication(tokens);
+			const withUnary = handleUnaryMinus(withMul);
+			const rpn = shuntingYard(withUnary);
+
+			rpnRef.current = rpn;
+
+			// 🔑 force redraw
+			if (ctxRef.current) {
+				draw(ctxRef.current);
+			}
+		} catch (e) {
+			rpnRef.current = null;
+
+			if (ctxRef.current) {
+				draw(ctxRef.current);
+			}
+		}
+	}, [expression]);
+
+
+
 	const draw = (ctx) => {
 		const canvas = ctx.canvas;
 		const view = viewRef.current;
@@ -130,7 +160,10 @@ export default function GraphCanvas() {
 		drawXAxis(ctx, canvas, view);
 		drawYAxis(ctx, canvas, view);
 
-		drawFunction(ctx, canvas, view);
+		if (rpnRef.current) {
+			drawFunction(ctx, canvas, view, rpnRef.current);
+		}
+
 		drawOrigin(ctx, canvas, view);
 	};
 
@@ -263,40 +296,36 @@ export default function GraphCanvas() {
 		}
 	}
 
-	function f(x) {
-		return 1/x; // change later
-	}
-
-	function drawFunction(ctx, canvas, view) {
+	function drawFunction(ctx, canvas, view, rpn) {
 		ctx.strokeStyle = "blue";
 		ctx.lineWidth = 2;
 		ctx.beginPath();
 
 		let firstPoint = true;
 
-		for (let px = 0; px <= canvas.width; px++) {
-			// screen → world
-			const worldX =
-				view.origin.x + (px - canvas.width / 2) / view.scale;
+		for (let px = 0; px < canvas.width; px++) {
+			const x = screenToWorld(px, 0, canvas, view).x;
+			let y;
 
-			const worldY = f(worldX);
-
-			// skip invalid values
-			if (!Number.isFinite(worldY)) {
+			try {
+				y = evaluateRPN(rpn, { x });
+			} catch {
 				firstPoint = true;
 				continue;
 			}
 
-			// world → screen
-			const screenX = px;
-			const screenY =
-				canvas.height / 2 - (worldY - view.origin.y) * view.scale;
+			if (!isFinite(y)) {
+				firstPoint = true;
+				continue;
+			}
+
+			const p = worldToScreen(x, y, canvas, view);
 
 			if (firstPoint) {
-				ctx.moveTo(screenX, screenY);
+				ctx.moveTo(p.x, p.y);
 				firstPoint = false;
 			} else {
-				ctx.lineTo(screenX, screenY);
+				ctx.lineTo(p.x, p.y);
 			}
 		}
 
@@ -304,5 +333,339 @@ export default function GraphCanvas() {
 	}
 
 
-	return <canvas ref={canvasRef} className="block" />;
+	// Helper functions for tokeniser
+	function isDigit(char) {
+		return char >= "0" && char <= "9";
+	}
+
+	function isLetter(char) {
+		return char >= "a" && char <= "z" || char >= "A" && char <= "Z";
+	}
+
+	function isOperator(char) {
+		return "+-*/^".includes(char);
+	}
+
+	function isFunctionName(name) {
+		return ["sin", "cos", "tan", "log", "sqrt"].includes(name);
+	}
+
+
+	function tokenize(input) {
+		const tokens = [];
+		let i = 0;
+
+		while (i < input.length) {
+			const char = input[i];
+
+			// 1️⃣ Ignore whitespace
+			if (char === " ") {
+				i++;
+				continue;
+			}
+
+			// 2️⃣ Numbers (including decimals)
+			if (isDigit(char) || char === ".") {
+				let numStr = "";
+
+				while (i < input.length && (isDigit(input[i]) || input[i] === ".")) {
+					numStr += input[i];
+					i++;
+				}
+
+				tokens.push({
+					type: "number",
+					value: parseFloat(numStr),
+				});
+
+				continue;
+			}
+
+			// 3️⃣ Letters → variables or function names
+			if (isLetter(char)) {
+				let name = "";
+
+				while (i < input.length && isLetter(input[i])) {
+					name += input[i];
+					i++;
+				}
+
+				if (isFunctionName(name)) {
+					tokens.push({ type: "function", value: name });
+				} else {
+					tokens.push({ type: "variable", value: name });
+				}
+
+				continue;
+			}
+
+			// 4️⃣ Operators
+			if (isOperator(char)) {
+				tokens.push({ type: "operator", value: char });
+				i++;
+				continue;
+			}
+
+			// 5️⃣ Parentheses
+			if (char === "(" || char === ")") {
+				tokens.push({ type: "paren", value: char });
+				i++;
+				continue;
+			}
+
+			// 6️⃣ Unknown character
+			throw new Error(`Unexpected character: '${char}'`);
+		}
+
+		return tokens;
+	}
+
+	function evaluateRPN(rpnTokens, variables = {}) {
+		const stack = [];
+
+		for (const token of rpnTokens) {
+			// 1️⃣ Numbers
+			if (token.type === "number") {
+				stack.push(token.value);
+				continue;
+			}
+
+			// 2️⃣ Variables (x, y, etc.)
+			if (token.type === "variable") {
+				if (!(token.value in variables)) {
+					throw new Error(`Variable ${token.value} not provided`);
+				}
+				stack.push(variables[token.value]);
+				continue;
+			}
+
+			// 3️⃣ Operators
+			if (token.type === "operator") {
+				const b = stack.pop();
+				const a = stack.pop();
+
+				stack.push(applyOperator(token.value, a, b));
+				continue;
+			}
+
+			// 4️⃣ Functions
+			if (token.type === "function") {
+				const a = stack.pop();
+				stack.push(applyFunction(token.value, a));
+				continue;
+			}
+		}
+
+		if (stack.length !== 1) {
+			throw new Error("Invalid expression");
+		}
+
+		return stack[0];
+	}
+
+	function applyOperator(op, a, b) {
+		switch (op) {
+			case "+": return a + b;
+			case "-": return a - b;
+			case "*": return a * b;
+			case "/": return a / b;
+			case "^": return Math.pow(a, b);
+			default:
+				throw new Error(`Unknown operator ${op}`);
+		}
+	}
+
+	function applyFunction(name, x) {
+		switch (name) {
+			case "sin": return Math.sin(x);
+			case "cos": return Math.cos(x);
+			case "tan": return Math.tan(x);
+			case "log": return Math.log(x);
+			case "sqrt": return Math.sqrt(x);
+			case "neg": return -x; // unary minus
+			default:
+				throw new Error(`Unknown function ${name}`);
+		}
+	}
+
+
+	const OPERATORS = {
+		"+": { precedence: 1, associativity: "left" },
+		"-": { precedence: 1, associativity: "left" },
+		"*": { precedence: 2, associativity: "left" },
+		"/": { precedence: 2, associativity: "left" },
+		"^": { precedence: 3, associativity: "right" },
+	};
+
+	function shuntingYard(tokens) {
+		const output = [];
+		const operators = [];
+
+		for (const token of tokens) {
+			// 1️⃣ Numbers & variables → output immediately
+			if (token.type === "number" || token.type === "variable") {
+				output.push(token);
+				continue;
+			}
+
+			// 2️⃣ Functions → go to operator stack
+			if (token.type === "function") {
+				operators.push(token);
+				continue;
+			}
+
+			// 3️⃣ Operators
+			if (token.type === "operator") {
+				while (
+					operators.length > 0 &&
+					(
+						operators[operators.length - 1].type === "function" ||
+						(
+							operators[operators.length - 1].type === "operator" &&
+							(
+								OPERATORS[operators[operators.length - 1].value].precedence >
+								OPERATORS[token.value].precedence ||
+								(
+									OPERATORS[operators[operators.length - 1].value].precedence ===
+									OPERATORS[token.value].precedence &&
+									OPERATORS[token.value].associativity === "left"
+								)
+							)
+						)
+					)
+				) {
+					output.push(operators.pop());
+				}
+
+				operators.push(token);
+				continue;
+			}
+
+			// 4️⃣ Left parenthesis
+			if (token.type === "paren" && token.value === "(") {
+				operators.push(token);
+				continue;
+			}
+
+			// 5️⃣ Right parenthesis
+			if (token.type === "paren" && token.value === ")") {
+				while (
+					operators.length > 0 &&
+					operators[operators.length - 1].value !== "("
+				) {
+					output.push(operators.pop());
+				}
+
+				// Remove '('
+				operators.pop();
+
+				// If function is on top, pop it too
+				if (
+					operators.length > 0 &&
+					operators[operators.length - 1].type === "function"
+				) {
+					output.push(operators.pop());
+				}
+
+				continue;
+			}
+		}
+
+		// 6️⃣ Drain remaining operators
+		while (operators.length > 0) {
+			output.push(operators.pop());
+		}
+
+		return output;
+	}
+
+	function shouldInsertMultiply(a, b) {
+		const aType = a.type;
+		const bType = b.type;
+
+		// number x, number (, number sin
+		if (aType === "number" &&
+			(bType === "variable" || bType === "function" || isLeftParen(b))) {
+			return true;
+		}
+
+		// x number, x x, x (, x sin
+		if (aType === "variable" &&
+			(bType === "number" || bType === "variable" || bType === "function" || isLeftParen(b))) {
+			return true;
+		}
+
+		// ) number, ) x, ) (, ) sin
+		if (isRightParen(a) &&
+			(bType === "number" || bType === "variable" || bType === "function" || isLeftParen(b))) {
+			return true;
+		}
+
+		return false;
+	}
+
+	function isLeftParen(token) {
+		return token.type === "paren" && token.value === "(";
+	}
+
+	function isRightParen(token) {
+		return token.type === "paren" && token.value === ")";
+	}
+
+	function insertImplicitMultiplication(tokens) {
+		const result = [];
+
+		for (let i = 0; i < tokens.length; i++) {
+			const current = tokens[i];
+			const prev = result[result.length - 1];
+
+			if (prev && shouldInsertMultiply(prev, current)) {
+				result.push({ type: "operator", value: "*" });
+			}
+
+			result.push(current);
+		}
+
+		return result;
+	}
+
+	function handleUnaryMinus(tokens) {
+		const result = [];
+
+		for (let i = 0; i < tokens.length; i++) {
+			const token = tokens[i];
+			const prev = result[result.length - 1];
+
+			if (
+				token.type === "operator" &&
+				token.value === "-" &&
+				(
+					!prev || // start of expression
+					prev.type === "operator" ||
+					(prev.type === "paren" && prev.value === "(")
+				)
+			) {
+				// Replace '-' with unary negation
+				result.push({ type: "function", value: "neg" });
+				continue;
+			}
+
+			result.push(token);
+		}
+
+		return result;
+	}
+
+
+	return <>
+		<canvas ref={canvasRef} className="block" />
+		<input
+			type="text"
+			value={expression}
+			onChange={(e) => setExpression(e.target.value)}
+			className="absolute top-4 left-4 z-10 w-64 px-3 py-2 border rounded shadow bg-white"
+			placeholder="Enter expression (e.g. x^2 + sin(x))"
+		/>
+
+	</>;
 }
