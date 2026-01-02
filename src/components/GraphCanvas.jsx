@@ -9,6 +9,12 @@ export default function GraphCanvas() {
 	const isPanningRef = useRef(false);
 	const lastMouseRef = useRef({ x: 0, y: 0 });
 
+	// for mobile
+	const lastTouchRef = useRef(null);
+	const lastPinchDistRef = useRef(null);
+
+
+
 	const MIN_SCALE = 10;
 	const MAX_SCALE = 500;
 
@@ -104,6 +110,84 @@ export default function GraphCanvas() {
 			draw(ctx);
 		};
 
+		// =======================
+		// Mobile touch support
+		// =======================
+
+		const getPinchDistance = (t1, t2) => {
+			const dx = t1.clientX - t2.clientX;
+			const dy = t1.clientY - t2.clientY;
+			return Math.hypot(dx, dy);
+		};
+
+		const onTouchStart = (e) => {
+			if (e.touches.length === 1) {
+				const t = e.touches[0];
+				lastTouchRef.current = { x: t.clientX, y: t.clientY };
+			}
+
+			if (e.touches.length === 2) {
+				lastPinchDistRef.current = getPinchDistance(
+					e.touches[0],
+					e.touches[1]
+				);
+			}
+		};
+
+		const onTouchMove = (e) => {
+			e.preventDefault();
+			const view = viewRef.current;
+
+			// 🖐️ Single-finger pan
+			if (e.touches.length === 1 && lastTouchRef.current) {
+				const t = e.touches[0];
+				const dx = t.clientX - lastTouchRef.current.x;
+				const dy = t.clientY - lastTouchRef.current.y;
+
+				view.origin.x -= dx / view.scale;
+				view.origin.y += dy / view.scale;
+
+				lastTouchRef.current = { x: t.clientX, y: t.clientY };
+				draw(ctx);
+			}
+
+			// 🤏 Pinch zoom
+			if (e.touches.length === 2) {
+				const [t1, t2] = e.touches;
+				const dist = getPinchDistance(t1, t2);
+
+				if (!lastPinchDistRef.current) {
+					lastPinchDistRef.current = dist;
+					return;
+				}
+
+				const zoomFactor = dist / lastPinchDistRef.current;
+
+				const centerX = (t1.clientX + t2.clientX) / 2;
+				const centerY = (t1.clientY + t2.clientY) / 2;
+
+				const before = screenToWorld(centerX, centerY, canvas, view);
+
+				view.scale *= zoomFactor;
+				view.scale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, view.scale));
+
+				const after = screenToWorld(centerX, centerY, canvas, view);
+
+				view.origin.x += before.x - after.x;
+				view.origin.y += before.y - after.y;
+
+				lastPinchDistRef.current = dist;
+				draw(ctx);
+			}
+		};
+
+		const onTouchEnd = () => {
+			lastTouchRef.current = null;
+			lastPinchDistRef.current = null;
+		};
+
+
+
 
 		window.addEventListener("resize", resize);
 		canvas.addEventListener("mousedown", onMouseDown);
@@ -111,6 +195,12 @@ export default function GraphCanvas() {
 		window.addEventListener("mouseup", stopPan);
 		canvas.addEventListener("mouseleave", stopPan);
 		canvas.addEventListener("wheel", onWheel, { passive: false });
+
+		// for mobile
+		canvas.addEventListener("touchstart", onTouchStart, { passive: false });
+		canvas.addEventListener("touchmove", onTouchMove, { passive: false });
+		canvas.addEventListener("touchend", onTouchEnd);
+
 
 
 		return () => {
@@ -120,6 +210,11 @@ export default function GraphCanvas() {
 			window.removeEventListener("mouseup", stopPan);
 			canvas.removeEventListener("mouseleave", stopPan);
 			canvas.removeEventListener("wheel", onWheel);
+
+			// for mobile
+			canvas.removeEventListener("touchstart", onTouchStart);
+			canvas.removeEventListener("touchmove", onTouchMove);
+			canvas.removeEventListener("touchend", onTouchEnd);
 		};
 
 	}, []);
@@ -658,7 +753,7 @@ export default function GraphCanvas() {
 
 
 	return <>
-		<canvas ref={canvasRef} className="block" />
+		<canvas ref={canvasRef} className="block touch-none" />
 		<input
 			type="text"
 			value={expression}
